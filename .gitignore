@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+llm_raw_debug.txt
+.DS_Store
