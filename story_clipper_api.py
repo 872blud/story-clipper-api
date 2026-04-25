@@ -1,32 +1,15 @@
 import json
-import os
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from openai import OpenAI
-
 # ================ CONFIG ================
-
-OPENAI_MODEL = "gpt-4o-mini"
 
 TARGET_HEIGHT = 1080
 MIN_CLIP_SEC = 20
 MAX_CLIP_SEC = 60
-
-# single llm call timeout (seconds)
-LLM_TIMEOUT = 180
-
-
-# ================ OPENAI CLIENT ================
-
-def get_openai_client():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise SystemExit("OPENAI_API_KEY is not set in environment")
-    return OpenAI(api_key=api_key)
 
 
 # ================ UTILS ================
@@ -178,113 +161,76 @@ def build_transcript_text(items, max_chars=50000):
     return "\n".join(parts)
 
 
-# ================ LLM HIGHLIGHT PICKING (OPENAI) ================
+# ================ HIGHLIGHT PICKING ================
 
-def choose_highlights_via_llm(items, max_highlights=6):
+def score_caption(text):
+    words = text.lower()
+    score = 0
+
+    strong_terms = [
+        "no way", "wait", "what", "why", "how", "help", "stop", "run",
+        "die", "dead", "kill", "killed", "fight", "betray", "betrayed",
+        "secret", "found", "lost", "win", "won", "fail", "failed",
+        "trap", "caught", "escape", "escaped", "hide", "hidden", "panic",
+        "laugh", "shout", "scream", "clutch", "crazy", "insane",
+    ]
+    for term in strong_terms:
+        if term in words:
+            score += 3
+
+    if "!" in text:
+        score += 2
+    if "?" in text:
+        score += 1
+    if len(text.split()) >= 12:
+        score += 1
+
+    return score
+
+
+def choose_highlights(items, max_highlights=6):
     if not items:
         return []
 
-    transcript = build_transcript_text(items, max_chars=50000)
     total_dur = items[-1]["end"]
+    candidates = []
 
-    prompt = f"""
-you are editing a minecraft / roblox story video into short tiktok clips.
+    for idx, item in enumerate(items):
+        window_start = max(0.0, item["start"] - 3.0)
+        window_end = min(total_dur, window_start + MAX_CLIP_SEC)
+        if window_end - window_start < MIN_CLIP_SEC:
+            window_start = max(0.0, window_end - MIN_CLIP_SEC)
 
-you get the transcript with timestamps.
-
-rules:
-- pick between 3 and {max_highlights} highlight clips
-- each clip must be between {MIN_CLIP_SEC} and {MAX_CLIP_SEC} seconds
-- focus on moments with:
-  - strong opening hook
-  - clear stakes or tension
-  - a big event, reveal, betrayal, clutch win, fail, confrontation, or emotional spike
-  - emotional energy (shouting, laughing, panic, shock)
-  - an ending that feels like a punch or a cliffhanger
-
-timestamps:
-- use seconds from 0 to {total_dur:.2f}
-- clips can overlap slightly but avoid duplicates
-
-output strict json only:
-
-{{
-  "highlights": [
-    {{"start_sec": 0.0, "end_sec": 0.0, "reason": "short reason"}}
-  ]
-}}
-
-do not add extra keys. do not write anything outside the json.
-
-transcript:
-{transcript}
-"""
-
-    print("    calling openai (one request, this may take a bit)...")
-
-    client = get_openai_client()
-
-    try:
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
-            response_format={"type": "json_object"},
-            max_output_tokens=600,
-            timeout=LLM_TIMEOUT,
-        )
-    except Exception as e:
-        raise SystemExit(f"openai api error: {e}")
-
-    # new responses api gives a text view
-    try:
-        json_str = resp.output_text
-    except Exception:
-        # fallback if property name changes
-        try:
-            first = resp.output[0].content[0].text
-            json_str = first
-        except Exception as e:
-            raise SystemExit(f"could not read response text: {e}")
-
-    try:
-        data = json.loads(json_str)
-    except Exception as e:
-        Path("llm_raw_debug.txt").write_text(json_str, encoding="utf-8")
-        raise SystemExit(f"could not parse json from api: {e}")
-
-    highlights_raw = data.get("highlights", [])
-    highlights = []
-
-    for h in highlights_raw:
-        try:
-            s = float(h.get("start_sec", 0.0))
-            e = float(h.get("end_sec", 0.0))
-        except Exception:
+        nearby = items[idx: idx + 12]
+        score = score_caption(item["text"]) + sum(score_caption(n["text"]) for n in nearby[:4])
+        if score <= 0:
             continue
 
-        if e <= s:
-            continue
-
-        dur = e - s
-        if dur < MIN_CLIP_SEC:
-            e = s + MIN_CLIP_SEC
-            dur = e - s
-        if dur > MAX_CLIP_SEC:
-            e = s + MAX_CLIP_SEC
-
-        s = max(0.0, s)
-        e = min(total_dur, e)
-
-        highlights.append(
+        candidates.append(
             {
-                "start": s,
-                "end": e,
-                "reason": h.get("reason", ""),
+                "start": window_start,
+                "end": window_end,
+                "score": score,
+                "reason": "high-energy caption window",
             }
         )
 
-    highlights.sort(key=lambda x: x["start"])
-    return highlights[:max_highlights]
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    chosen = []
+    for candidate in candidates:
+        overlaps = any(
+            candidate["start"] < existing["end"] and candidate["end"] > existing["start"]
+            for existing in chosen
+        )
+        if overlaps:
+            continue
+        chosen.append(candidate)
+        if len(chosen) >= max_highlights:
+            break
+
+    chosen.sort(key=lambda x: x["start"])
+    return [{"start": h["start"], "end": h["end"], "reason": h["reason"]} for h in chosen]
 
 
 # ================ CLIP BOUNDARIES ================
@@ -398,17 +344,17 @@ def main():
         raise SystemExit("empty captions after parsing; open captions.vtt and check format")
     print(f"    parsed {len(items)} caption segments")
 
-    print("[3/6] building transcript for llm...")
+    print("[3/6] building transcript...")
     transcript_txt = build_transcript_text(items)
     (job_dir / "transcript.txt").write_text(transcript_txt, encoding="utf-8")
     print(f"    transcript length: {len(transcript_txt)} characters")
 
-    print("[4/6] choosing highlights via openai...")
-    highlights = choose_highlights_via_llm(items, max_highlights=min(8, parts))
+    print("[4/6] choosing highlights...")
+    highlights = choose_highlights(items, max_highlights=min(8, parts))
     if not highlights:
-        print("    api returned no highlights, continuing with story parts only")
+        print("    no highlights found, continuing with story parts only")
     else:
-        print(f"    api picked {len(highlights)} highlight segments")
+        print(f"    picked {len(highlights)} highlight segments")
 
     snapped_highlights = []
     for h in highlights:
@@ -453,7 +399,6 @@ def main():
     meta = {
         "url": url,
         "title": title_safe,
-        "model": OPENAI_MODEL,
         "video": str(video.name),
         "captions": str(vtt.name),
         "highlights": highlights,
